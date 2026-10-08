@@ -1,0 +1,1 @@
+Migration directory. The app uses safe startup table creation for the hackathon demo; Alembic is included for production schema evolution.

@@ -1,0 +1,584 @@
+﻿from __future__ import annotations
+
+from sqlalchemy import select, func
+from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from app.db.session import get_db
+from app.db.models import (
+    AuditLog,
+    Payment,
+    RiskAssessment,
+    Seller,
+    SellerOffer,
+    Task,
+    Transaction,
+    User,
+    Verification,
+)
+from app.schemas import (
+    AnalyticsQuery,
+    FailureScenarioRequest,
+    PaymentCaptureRequest,
+    PaymentCreateRequest,
+    TaskCreate,
+    TaskRunResponse,
+)
+from app.services.orchestrator import Orchestrator
+from app.payments.paypal_service import PayPalService, PayPalError
+
+router = APIRouter()
+
+
+@router.get("/health")
+def health(db: Session = Depends(get_db)):
+    db.execute(select(func.count(User.id)))
+    return {"status": "ok", "service": "paypilot-api"}
+
+
+@router.get("/ready")
+def ready(db: Session = Depends(get_db)):
+    db.execute(select(func.count(User.id)))
+    return {"status": "ready"}
+
+
+@router.post("/tasks")
+def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
+    user = db.scalar(select(User).where(User.email == "demo@paypilot.local"))
+
+    if not user:
+        raise HTTPException(500, "Demo user not seeded")
+
+    task = Task(
+        user_id=user.id,
+        demo_mode=True,
+        **payload.model_dump()
+    )
+
+    db.add(task)
+    db.flush()
+
+    sellers = list(
+        db.scalars(
+            select(Seller).where(Seller.availability == True)
+        ).all()
+    )
+
+    for seller in sellers:
+        db.add(
+            SellerOffer(
+                task_id=task.id,
+                seller_id=seller.id,
+                price=seller.base_price,
+                eta_hours=seller.eta_hours,
+                quality_score=seller.quality_score,
+            )
+        )
+
+    db.commit()
+    db.refresh(task)
+
+    return {
+        "id": task.id,
+        "status": task.status,
+        "title": task.title
+    }
+
+
+@router.post("/tasks/{task_id}/run", response_model=TaskRunResponse)
+def run_task(task_id: int, db: Session = Depends(get_db)):
+    task = db.get(Task, task_id)
+
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    try:
+        result = Orchestrator(db).run(task)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+    offer = result["offer"]
+    seller = offer.seller
+    risk = result["risk"]
+    payment = result["payment"]
+    verification = result["verification"]
+
+    return TaskRunResponse(
+        task_id=task.id,
+        status=task.status,
+        selected_offer_id=offer.id,
+        selected_seller=seller.name,
+        negotiated_price=(
+            payment.amount if payment else risk.amount
+        ),
+        risk_score=risk.risk_score,
+        risk_level=risk.risk_level,
+        payment_status=(
+            payment.status if payment else "BLOCKED"
+        ),
+        verification_score=(
+            verification.score if verification else None
+        ),
+        verification_status=(
+            verification.status if verification else None
+        ),
+        message=(
+            "Workflow completed"
+            if payment
+            else "Workflow blocked by policy"
+        ),
+    )
+
+
+@router.post("/demo/failure")
+def run_failure(
+    payload: FailureScenarioRequest,
+    db: Session = Depends(get_db)
+):
+    user = db.scalar(
+        select(User).where(User.email == "demo@paypilot.local")
+    )
+
+    task = Task(
+        user_id=user.id,
+        title="Demo Failure Scenario",
+        description=f"Reproducible {payload.scenario} scenario",
+        budget_max=100,
+        deadline_hours=24,
+        payment_condition="release_after_verification",
+        quality_requirement="tests_pass",
+        demo_mode=True,
+    )
+
+    db.add(task)
+    db.flush()
+
+    sellers = list(
+        db.scalars(select(Seller).order_by(Seller.id)).all()
+    )
+
+    for s in sellers:
+        db.add(
+            SellerOffer(
+                task_id=task.id,
+                seller_id=s.id,
+                price=s.base_price,
+                eta_hours=s.eta_hours,
+                quality_score=s.quality_score,
+            )
+        )
+
+    db.commit()
+
+    result = Orchestrator(db).run(
+        task,
+        force_fail_verification=(
+            payload.scenario == "verification_failed"
+        ),
+        force_budget_failure=(
+            payload.scenario == "budget_exceeded"
+        ),
+    )
+
+    db.refresh(task)
+
+    risk = result["risk"]
+    verification = result["verification"]
+
+    return {
+        "task_id": task.id,
+        "status": task.status,
+        "risk_score": risk.risk_score,
+        "risk_level": risk.risk_level,
+        "verification_status": (
+            verification.status if verification else None
+        ),
+    }
+
+
+@router.post("/payments/create")
+async def create_payment(
+    payload: PaymentCreateRequest,
+    db: Session = Depends(get_db)
+):
+    task = db.get(Task, payload.task_id)
+
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    payment = db.scalar(
+        select(Payment)
+        .where(Payment.task_id == task.id)
+        .order_by(Payment.id.desc())
+    )
+
+    if not payment:
+        raise HTTPException(
+            400,
+            "Run the task workflow first"
+        )
+
+    service = PayPalService()
+
+    try:
+        order = await service.create_order(
+            payment.amount,
+            payment.currency
+        )
+    except PayPalError as exc:
+        raise HTTPException(502, str(exc))
+
+    payment.provider_order_id = order["id"]
+
+    payment.approval_url = next(
+        (
+            l.get("href")
+            for l in order.get("links", [])
+            if l.get("rel") in {"approve", "payer-action"}
+        ),
+        None,
+    )
+
+    payment.status = "PAYPAL_ORDER_CREATED"
+
+    db.commit()
+
+    return {
+        "paypal_order_id": payment.provider_order_id,
+        "status": payment.status,
+        "approval_url": payment.approval_url,
+        "demo_mode": not service.live,
+    }
+
+
+# NEW: PayPal Authorization
+@router.post("/payments/authorize")
+async def authorize_payment(
+    payload: PaymentCreateRequest,
+    db: Session = Depends(get_db)
+):
+    task = db.get(Task, payload.task_id)
+
+    payment = db.scalar(
+        select(Payment)
+        .where(Payment.task_id == payload.task_id)
+        .order_by(Payment.id.desc())
+    )
+
+    if not task or not payment:
+        raise HTTPException(
+            404,
+            "Payment not found"
+        )
+
+    if not payment.provider_order_id:
+        raise HTTPException(
+            400,
+            "PayPal order not created"
+        )
+
+    if payment.status == "AUTHORIZED":
+        return {
+            "status": "AUTHORIZED",
+            "idempotent": True
+        }
+
+    service = PayPalService()
+
+    try:
+        result = await service.authorize_order(
+            payment.provider_order_id
+        )
+    except PayPalError as exc:
+        raise HTTPException(502, str(exc))
+
+    payment.status = "AUTHORIZED"
+
+    db.commit()
+
+    return {
+        "status": "AUTHORIZED",
+        "paypal": result
+    }
+
+
+@router.post("/payments/capture")
+async def capture_payment(
+    payload: PaymentCaptureRequest,
+    db: Session = Depends(get_db)
+):
+    task = db.get(Task, payload.task_id)
+
+    payment = db.scalar(
+        select(Payment)
+        .where(Payment.task_id == payload.task_id)
+        .order_by(Payment.id.desc())
+    )
+
+    verification = db.scalar(
+        select(Verification)
+        .where(Verification.task_id == payload.task_id)
+    )
+
+    if not task or not payment:
+        raise HTTPException(
+            404,
+            "Payment not found"
+        )
+
+    if not verification or verification.status != "PASSED":
+        raise HTTPException(
+            409,
+            "Payment cannot be captured until verification passes"
+        )
+
+    if payment.status == "COMPLETED":
+        return {
+            "status": "COMPLETED",
+            "idempotent": True
+        }
+
+    service = PayPalService()
+
+    if not payment.provider_order_id:
+        raise HTTPException(
+            400,
+            "PayPal order not created"
+        )
+
+    try:
+        result = await service.capture_order(
+            payment.provider_order_id
+        )
+    except PayPalError as exc:
+        raise HTTPException(502, str(exc))
+
+    payment.status = "COMPLETED"
+
+    db.add(
+        Transaction(
+            payment_id=payment.id,
+            paypal_order_id=payment.provider_order_id,
+            amount=payment.amount,
+            risk_score=0,
+            verification_score=verification.score,
+            status="COMPLETED",
+        )
+    )
+
+    db.commit()
+
+    return {
+        "status": "COMPLETED",
+        "paypal": result
+    }
+
+
+@router.post("/paypal/webhook")
+async def paypal_webhook(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    body = await request.json()
+
+    service = PayPalService()
+
+    headers = {
+        k.lower(): v
+        for k, v in request.headers.items()
+    }
+
+    if not await service.verify_webhook(headers, body):
+        raise HTTPException(
+            400,
+            "Invalid PayPal webhook"
+        )
+
+    from app.db.models import WebhookEvent
+
+    event_id = (
+        body.get("id")
+        or f"unknown-{hash(str(body))}"
+    )
+
+    existing = db.scalar(
+        select(WebhookEvent)
+        .where(
+            WebhookEvent.provider_event_id == event_id
+        )
+    )
+
+    if existing:
+        return {
+            "status": "ignored_duplicate"
+        }
+
+    event = WebhookEvent(
+        provider_event_id=event_id,
+        event_type=body.get(
+            "event_type",
+            "unknown"
+        ),
+        payload=body,
+        processed=True,
+    )
+
+    db.add(event)
+    db.commit()
+
+    return {
+        "status": "processed"
+    }
+
+
+@router.get("/transactions")
+def transactions(
+    db: Session = Depends(get_db)
+):
+    rows = db.scalars(
+        select(Transaction)
+        .order_by(Transaction.id.desc())
+    ).all()
+
+    return [
+        {
+            "id": x.id,
+            "paypal_order_id": x.paypal_order_id,
+            "amount": x.amount,
+            "currency": x.currency,
+            "risk_score": x.risk_score,
+            "verification_score": x.verification_score,
+            "status": x.status,
+            "created_at": x.created_at.isoformat(),
+        }
+        for x in rows
+    ]
+
+
+@router.get("/tasks/{task_id}/audit")
+def audit(
+    task_id: int,
+    db: Session = Depends(get_db)
+):
+    rows = db.scalars(
+        select(AuditLog)
+        .where(AuditLog.task_id == task_id)
+        .order_by(AuditLog.timestamp.asc())
+    ).all()
+
+    return [
+        {
+            "actor": x.actor,
+            "action": x.action,
+            "status": x.status,
+            "metadata": x.meta,
+            "timestamp": x.timestamp.isoformat(),
+        }
+        for x in rows
+    ]
+
+
+@router.get("/dashboard/summary")
+def dashboard_summary(
+    db: Session = Depends(get_db)
+):
+    tx = db.scalars(select(Transaction)).all()
+    risks = db.scalars(select(RiskAssessment)).all()
+    verifications = db.scalars(
+        select(Verification)
+    ).all()
+
+    return {
+        "transactions": len(tx),
+        "total_value": round(
+            sum(x.amount for x in tx),
+            2
+        ),
+        "avg_risk": round(
+            sum(x.risk_score for x in risks)
+            / len(risks),
+            1
+        ) if risks else 0,
+        "verification_rate": round(
+            sum(
+                1
+                for x in verifications
+                if x.status == "PASSED"
+            )
+            / len(verifications)
+            * 100,
+            1,
+        ) if verifications else 0,
+        "high_risk": sum(
+            1
+            for x in risks
+            if x.risk_level == "HIGH"
+        ),
+        "blocked": sum(
+            1
+            for x in db.scalars(select(Task)).all()
+            if x.status in {
+                "PAYMENT_BLOCKED",
+                "HUMAN_APPROVAL_REQUIRED",
+                "VERIFICATION_FAILED",
+            }
+        ),
+    }
+
+
+@router.post("/analytics/query")
+def analytics_query(
+    payload: AnalyticsQuery,
+    db: Session = Depends(get_db)
+):
+    q = payload.query.lower()
+
+    tx = db.scalars(
+        select(Transaction)
+        .order_by(Transaction.id.desc())
+    ).all()
+
+    if "high-risk" in q or "high risk" in q:
+        filtered = [
+            x for x in tx
+            if x.risk_score >= 60
+        ]
+        title = "High-Risk Transactions"
+
+    elif "blocked" in q:
+        filtered = []
+        title = "Blocked Payment Signals"
+
+    elif "above" in q and "$100" in q:
+        filtered = [
+            x for x in tx
+            if x.amount > 100
+        ]
+        title = "Transactions Above $100"
+
+    else:
+        filtered = tx[:10]
+        title = "Recent Transactions"
+
+    return {
+        "title": title,
+        "rows": [
+            {
+                "transaction_id": x.id,
+                "paypal_order": (
+                    x.paypal_order_id or "—"
+                ),
+                "amount": x.amount,
+                "risk": x.risk_score,
+                "verification": x.verification_score,
+                "status": x.status,
+            }
+            for x in filtered
+        ],
+        "explanation": (
+            "Analytics Agent translated your "
+            "natural-language request into a safe, "
+            "deterministic query over the "
+            "transaction ledger."
+        ),
+    }
